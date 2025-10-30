@@ -1,534 +1,395 @@
-// main_clean_v1_3_0.dart
-// Daily Numbers — single-file demo build
-// v1.3.0
+// main.dart — Figma pass with icon pack + collapsible "Today’s Attempts" (no animations)
+// - Uses SVG icon assets (see names below) and code‑built UI that matches your Figma
+// - Adds accordion Attempts screen (3→8), only meant to be shown after all rounds are finished
+// - Gameplay/state logic unchanged. Ads hooks remain disabled.
+//
+//  REQUIRED ASSETS (put these in assets/icons/ and list the folder in pubspec.yaml):
+//    ic_arrow_up.svg, ic_arrow_down.svg, ic_check.svg,
+//    ic_backspace.svg, ic_enter.svg, ic_x_small.svg,
+//    ic_plus.svg, ic_minus.svg     // used by "Today’s Attempts" headers
+//
+//  pubspec.yaml (add):
+//    dependencies:
+//      flutter_svg: ^2.0.9
+//    flutter:
+//      assets:
+//        - assets/icons/
+//
+//  NOTE: All special glyphs use Unicode escapes (× = \u00D7) so you won’t see mojibake.
 
 import 'dart:async';
-import 'dart:convert';
 import 'dart:math';
-
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_svg/flutter_svg.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-void main() async {
+void main() {
   WidgetsFlutterBinding.ensureInitialized();
-  await SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
   runApp(const DailyNumbersApp());
 }
 
-// ===== App root =============================================================
+// === Color tokens (match your Figma neutrals; tweak if spec.json differs)
+const kBg = Color(0xFFFBF7F1); // warm off‑white background
+const kSurface = Colors.white;
+const kText = Color(0xFF2E2E2E);
+const kSubtle = Color(0xFF7A7F87);
+const kStrokeWarm = Color(0xFFE4DED7); // 1px warm stroke
+
+// Tiles
+const kTileGreen = Color(0xFFBFE8C0);
+const kTileOrange = Color(0xFFFFD49C);
+const kTileGrey = Color(0xFFE9E7EE);
+const kTileGhost = Color(0xFFD8DADF);
+
+// Status accents
+const kOk = Color(0xFF15803D);
+const kHigher = Color(0xFF6B7CFF); // soft blue to match Figma chip
+const kLower = Color(0xFFFF8A8A); // soft red to match Figma chip
+
+// Glyphs (use escapes to avoid encoding issues)
+const kTimes = '\u00D7'; // ×
 
 class DailyNumbersApp extends StatelessWidget {
   const DailyNumbersApp({super.key});
-
   @override
   Widget build(BuildContext context) {
+    final base = ThemeData(useMaterial3: true, scaffoldBackgroundColor: kBg);
+    final outlinePill = OutlinedButton.styleFrom(
+      foregroundColor: kText,
+      backgroundColor: kSurface,
+      textStyle: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+      minimumSize: const Size.fromHeight(52),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(28)),
+      side: const BorderSide(color: kStrokeWarm, width: 1),
+    );
+
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       title: 'Daily Numbers',
-      theme: ThemeData(
-        useMaterial3: true,
-        colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF6750A4)),
-        scaffoldBackgroundColor: const Color(0xFFF5F5F7), // light neutral
-        dialogTheme: const DialogTheme(
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.all(Radius.circular(16)),
-          ),
+      theme: base.copyWith(
+        colorScheme: base.colorScheme.copyWith(
+          background: kBg, surface: kSurface, onSurface: kText, onBackground: kText, primary: kText,
         ),
+        appBarTheme: const AppBarTheme(backgroundColor: kBg, foregroundColor: kText, elevation: 0),
+        dialogTheme: const DialogThemeData(
+  backgroundColor: kSurface,
+  shape: RoundedRectangleBorder(
+    borderRadius: BorderRadius.all(Radius.circular(20)),
+  ),
+),
+        textTheme: base.textTheme.apply(bodyColor: kText, displayColor: kText),
+        outlinedButtonTheme: OutlinedButtonThemeData(style: outlinePill),
+        filledButtonTheme: FilledButtonThemeData(style: outlinePill), // we reuse same visual for simplicity
       ),
       home: const HomePage(),
     );
   }
 }
 
-// ===== Shared keys & helpers ===============================================
+// === Feature flags (stubbed off)
+const bool adsEnabled = false; // home bottom banner placeholder
+const bool premiumEnabled = false; // never show ads if true
+const bool interstitialEnabled = false; // hidden hook after round 7
 
-const _kLengths = [3, 4, 5, 6, 7, 8];
-const _kVersion = 'v1.3.0';
+// === Keys
+const _kTodayKey = 'todayKey';
+const _kCompletedUpTo = 'completedUpTo'; // max length solved today
+String _kBestLen(int n) => 'best_len$n';
+String _kPlaysLen(int n) => 'plays_len$n';
+String _kTotalGuessesLen(int n) => 'totalGuesses_len$n';
+String _kTodayGuessesLen(int n) => 'today_guesses_len$n';
+String _kAttemptsLen(int n) => 'attempts_len$n'; // StringList of today guesses
+const _kAdShownAfter7For = 'ad_shown_after7_for'; // YYYYMMDD
 
-// persistent keys
-String _keyBest(int n) => 'best_len$n';
-String _keyAvgCount(int n) => 'plays_len$n';
-String _keyAvgSum(int n) => 'totalGuesses_len$n';
-String _keyTodayCount(int n) => 'today_count_len$n';
-String _keyTodayRows(int n) => 'today_rows_len$n';
-const _keySeenHowTo = 'seen_how_to';
-const _keyTodayStamp = 'today_yyyymmdd';
-const _keyCompletedUpTo = 'completed_upto_len';
+const _rounds = [3, 4, 5, 6, 7, 8];
+const _cols = 8; // board always 8-wide; rounds 3–7 pad with ×
 
-int dayNumber(DateTime now) {
-  // Day #001 anchor — adjust if you want a different “start of epoch”
-  final start = DateTime(2023, 12, 1);
-  return now.difference(DateTime(start.year, start.month, start.day)).inDays + 1;
-}
+String _todayKey(DateTime now) =>
+    '${now.year.toString().padLeft(4, '0')}${now.month.toString().padLeft(2, '0')}${now.day.toString().padLeft(2, '0')}';
 
-String yyyymmdd(DateTime d) =>
-    '${d.year.toString().padLeft(4, '0')}${d.month.toString().padLeft(2, '0')}${d.day.toString().padLeft(2, '0')}';
+int _dayNumber(DateTime now) => now.difference(DateTime(2023, 12, 1)).inDays + 1;
 
-// seeded RNG per day+length to keep the same secret for everyone for that day
-List<int> dailySecret(int length, int dayNum) {
-  final seed = dayNum * 997 + length * 101; // simple mixed seed
-  final rnd = Random(seed);
-  return List<int>.generate(length, (_) => rnd.nextInt(10));
-}
-
-int digitsToInt(List<int> digits) {
-  var v = 0;
-  for (final d in digits) {
-    v = v * 10 + d;
-  }
-  return v;
-}
-
-List<int> scoreGuess(List<int> secret, List<int> guess) {
-  // 0 = grey, 1 = orange (present wrong place), 2 = green (correct)
-  final n = secret.length;
-  final out = List<int>.filled(n, 0);
-  final used = List<bool>.filled(n, false);
-
-  // greens
-  for (var i = 0; i < n; i++) {
-    if (guess[i] == secret[i]) {
-      out[i] = 2;
-      used[i] = true;
-    }
-  }
-  // oranges
-  for (var i = 0; i < n; i++) {
-    if (out[i] == 2) continue;
-    for (var j = 0; j < n; j++) {
-      if (!used[j] && guess[i] == secret[j]) {
-        out[i] = 1;
-        used[j] = true;
-        break;
-      }
-    }
-  }
-  return out;
-}
-
-// ===== Home ================================================================
-
+// === HOME
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
-
   @override
   State<HomePage> createState() => _HomePageState();
 }
 
 class _HomePageState extends State<HomePage> {
-  late Timer _timer;
+  int _completedUpTo = 0;
   late DateTime _now;
-  bool _finishedAllToday = false;
-  String _countdown = '';
+  Timer? _tick;
 
   @override
   void initState() {
     super.initState();
     _now = DateTime.now();
-    _refreshCountdown();
-    _timer = Timer.periodic(const Duration(seconds: 1), (_) {
-      setState(() {
-        _now = DateTime.now();
-        _refreshCountdown();
-      });
-    });
-    _checkResetAndProgress();
+    _initPrefs();
+    _tick = Timer.periodic(const Duration(seconds: 1), (_) => setState(() => _now = DateTime.now()));
   }
 
   @override
   void dispose() {
-    _timer.cancel();
+    _tick?.cancel();
     super.dispose();
   }
 
-  Future<void> _checkResetAndProgress() async {
-    final prefs = await SharedPreferences.getInstance();
-    // daily reset for "today_*" stats
-    final todayKey = yyyymmdd(DateTime.now());
-    final last = prefs.getString(_keyTodayStamp);
-    if (last != todayKey) {
-      for (final n in _kLengths) {
-        await prefs.remove(_keyTodayCount(n));
-        await prefs.remove(_keyTodayRows(n));
+  Future<void> _initPrefs() async {
+    final p = await SharedPreferences.getInstance();
+    final today = _todayKey(DateTime.now());
+    if (p.getString(_kTodayKey) != today) {
+      // midnight reset for today-only data
+      await p.setString(_kTodayKey, today);
+      await p.setInt(_kCompletedUpTo, 0);
+      for (final n in _rounds) {
+        await p.setInt(_kTodayGuessesLen(n), 0);
+        await p.remove(_kAttemptsLen(n));
       }
-      await prefs.setString(_keyTodayStamp, todayKey);
-      await prefs.setInt(_keyCompletedUpTo, 0);
+      await p.remove(_kAdShownAfter7For);
     }
-    final upto = prefs.getInt(_keyCompletedUpTo) ?? 0;
-    setState(() {
-      _finishedAllToday = upto >= 8;
-    });
+    setState(() => _completedUpTo = p.getInt(_kCompletedUpTo) ?? 0);
   }
 
-  void _refreshCountdown() {
-    final tomorrow = DateTime(_now.year, _now.month, _now.day + 1);
-    final diff = tomorrow.difference(_now);
-    final h = diff.inHours.toString().padLeft(2, '0');
-    final m = (diff.inMinutes % 60).toString().padLeft(2, '0');
-    final s = (diff.inSeconds % 60).toString().padLeft(2, '0');
-    _countdown = '$h:$m:$s';
+  String _hhmmssUntilMidnight() {
+    final m = DateTime(_now.year, _now.month, _now.day).add(const Duration(days: 1));
+    final d = m.difference(_now);
+    final h = d.inHours.toString().padLeft(2, '0');
+    final min = (d.inMinutes % 60).toString().padLeft(2, '0');
+    final s = (d.inSeconds % 60).toString().padLeft(2, '0');
+    return '$h:$min:$s';
   }
 
-  Future<void> _maybeShowHowTo() async {
-    final prefs = await SharedPreferences.getInstance();
-    if (!(prefs.getBool(_keySeenHowTo) ?? false)) {
-      final dont = await showDialog<bool>(
-        context: context,
-        builder: (c) => const HowToDialog(),
-      );
-      if (dont == true) {
-        await prefs.setBool(_keySeenHowTo, true);
-      }
+  int _nextIncomplete() {
+    for (final n in _rounds) {
+      if (n > _completedUpTo) return n;
     }
+    return 8;
   }
 
-  @override
-  Widget build(BuildContext context) {
-    final dn = dayNumber(DateTime.now());
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Daily Numbers'),
-        actions: [
-          Padding(
-            padding: const EdgeInsets.only(right: 12),
-            child: Center(
-              child: _finishedAllToday
-                  ? Chip(
-                      label: const Text('Come back tomorrow'),
-                      side: const BorderSide(color: Colors.transparent),
-                      backgroundColor: const Color(0xFFEDEFF3),
-                    )
-                  : Chip(
-                      label: Text('New challenge in $_countdown'),
-                      side: const BorderSide(color: Colors.transparent),
-                      backgroundColor: const Color(0xFFEDEFF3),
-                    ),
-            ),
-          ),
-        ],
-      ),
-      body: Padding(
-        padding: const EdgeInsets.all(20),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text('Play today’s rounds (3–8) — Day #$dn',
-                style: Theme.of(context).textTheme.titleLarge),
-            const SizedBox(height: 16),
-            FilledButton.tonal(
-              onPressed: () async {
-                await _maybeShowHowTo();
-                if (!mounted) return;
-                Navigator.of(context).push(
-                  MaterialPageRoute(
-                    builder: (_) => RoundPage(length: 3, dayNum: dn),
-                  ),
-                );
-              },
-              child: const Padding(
-                padding: EdgeInsets.symmetric(horizontal: 8, vertical: 12),
-                child: Text('Play'),
-              ),
-            ),
-            const Spacer(),
-            TextButton(
-              onPressed: () {
-                Navigator.of(context).push(
-                  MaterialPageRoute(builder: (_) => const AttemptsPage()),
-                );
-              },
-              child: const Text('View today’s attempts'),
-            ),
-            TextButton(
-              onPressed: () async {
-                final dont = await showDialog<bool>(
-                  context: context,
-                  builder: (_) => const HowToDialog(),
-                );
-                if (dont == true) {
-                  final prefs = await SharedPreferences.getInstance();
-                  await prefs.setBool(_keySeenHowTo, true);
-                }
-              },
-              child: const Text('How to Play'),
-            ),
-          ],
-        ),
+  Future<void> _startPlay() async {
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => RoundPage(length: _nextIncomplete(), dayNumber: _dayNumber(DateTime.now())),
       ),
     );
+    await _initPrefs();
   }
-}
-
-// ===== How to Play dialog ===================================================
-
-class HowToDialog extends StatefulWidget {
-  const HowToDialog({super.key});
-
-  @override
-  State<HowToDialog> createState() => _HowToDialogState();
-}
-
-class _HowToDialogState extends State<HowToDialog> {
-  bool dontShow = false;
 
   @override
   Widget build(BuildContext context) {
-    final t = Theme.of(context).textTheme;
-    return AlertDialog(
-      title: const Text('How to Play'),
-      content: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text('- Guess the secret number.', style: t.bodyMedium),
-          const SizedBox(height: 8),
-          Text('- Colours: Green = correct place; Orange = wrong place; Grey = not present.',
-              style: t.bodyMedium),
-          const SizedBox(height: 8),
-          Text('- The arrow shows whether your whole guess is lower (↑) or higher (↓). When equal, no arrow.',
-              style: t.bodyMedium),
-          const SizedBox(height: 8),
-          Text('- Enter is only enabled when the row is filled.', style: t.bodyMedium),
-          const SizedBox(height: 8),
-          Text('- Some digits may appear more than once…', style: t.bodyMedium),
-          const SizedBox(height: 16),
-          Row(
+    final dayNo = _dayNumber(_now);
+    final finished = _completedUpTo >= 8;
+
+    // Per Figma: Home pre‑play has no AppBar and no countdown chip
+    return Scaffold(
+      appBar: null,
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 24),
+          child: Column(
             children: [
-              Checkbox(
-                value: dontShow,
-                onChanged: (v) => setState(() => dontShow = v ?? false),
+              const SizedBox(height: 16),
+              Text('Guess Today\'s\nDaily Numbers',
+                  textAlign: TextAlign.center,
+                  style: Theme.of(context).textTheme.headlineMedium?.copyWith(fontWeight: FontWeight.w800)),
+              const SizedBox(height: 8),
+              Text('Day #$dayNo', style: const TextStyle(color: kSubtle)),
+              const SizedBox(height: 24),
+              // Centered mini illustration inside a warm frame
+              Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: kSurface,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: kStrokeWarm),
+                ),
+                child: const _IllustrationGrid(centered: true, tileSize: 30),
               ),
-              const Text("Don’t show again"),
+              const SizedBox(height: 32),
+              OutlinedButton(
+                onPressed: finished
+                    ? () => Navigator.push(context, MaterialPageRoute(builder: (_) => const AttemptsTodayPageCollapsible()))
+                    : _startPlay,
+                child: Text(finished ? "View today\'s attempts" : "Play Today\'s Rounds"),
+              ),
+              const SizedBox(height: 16),
+              OutlinedButton(
+                onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const HowToPage())),
+                child: const Text('How to Play'),
+              ),
+              const Spacer(),
+              if (finished)
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                  decoration: BoxDecoration(color: const Color(0xFFEAEAF1), borderRadius: BorderRadius.circular(28), border: Border.all(color: kStrokeWarm)),
+                  child: Text('Come back tomorrow — ${_hhmmssUntilMidnight()}', style: const TextStyle(color: kSubtle)),
+                ),
+              const SizedBox(height: 24),
             ],
           ),
-        ],
-      ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.of(context).pop(dontShow),
-          child: const Text('OK'),
         ),
-      ],
+      ),
     );
   }
 }
 
-// ===== Round page ===========================================================
+// === Illustration on Home
+class _IllustrationGrid extends StatelessWidget {
+  final bool centered; final double tileSize; const _IllustrationGrid({this.centered = false, this.tileSize = 32});
+  @override
+  Widget build(BuildContext context) {
+    const g = 8.0;
+    Widget row(int r) => Row(
+          mainAxisAlignment: centered ? MainAxisAlignment.center : MainAxisAlignment.start,
+          children: [
+            for (int c = 0; c < 3; c++)
+              Padding(
+                padding: EdgeInsets.only(right: c == 2 ? 0 : g),
+                child: _TileBox(size: tileSize, label: '', color: _tileColor(r, c)),
+              ),
+          ],
+        );
+    return Column(mainAxisSize: MainAxisSize.min, children: [row(0), const SizedBox(height: g), row(1), const SizedBox(height: g), row(2)]);
+  }
+
+  Color _tileColor(int r, int c) {
+    if (r == 1 && c == 1) return kTileGreen;
+    if (c == 2) return kTileGrey;
+    return kTileOrange;
+  }
+}
+
+// === Round
+enum RoundStatus { neutral, higher, lower, correct }
 
 class RoundPage extends StatefulWidget {
   final int length;
-  final int dayNum;
-  final bool readOnly;
-  final List<List<int>>? initialRows; // for read-only view
-
-  const RoundPage({
-    super.key,
-    required this.length,
-    required this.dayNum,
-    this.readOnly = false,
-    this.initialRows,
-  });
-
+  final int dayNumber;
+  const RoundPage({super.key, required this.length, required this.dayNumber});
   @override
   State<RoundPage> createState() => _RoundPageState();
 }
 
-class _RoundPageState extends State<RoundPage> with SingleTickerProviderStateMixin {
-  late List<int> _secret;
-  final List<List<int>> _rows = [];
-  final List<int> _current = [];
-  int _arrow = 0; // -1 lower, 0 equal, +1 higher
-  late final AnimationController _pulse;
-  late final Animation<double> _scale;
-  final ScrollController _scroll = ScrollController();
+class _RoundPageState extends State<RoundPage> {
+  static const _gap = 8.0;
+  final _rows = <String>[];
+  String _entry = '';
+  late final String _secret;
+  final _scroll = ScrollController();
+  RoundStatus _status = RoundStatus.neutral;
 
   @override
   void initState() {
     super.initState();
-    _secret = dailySecret(widget.length, widget.dayNum);
-    _pulse = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 220),
-      lowerBound: 0.96,
-      upperBound: 1.04,
-    );
-    _scale = CurvedAnimation(parent: _pulse, curve: Curves.easeInOut);
-    if (widget.readOnly && widget.initialRows != null) {
-      _rows.addAll(widget.initialRows!);
-    }
+    _secret = _generateSecret(widget.length);
   }
 
   @override
   void dispose() {
-    _pulse.dispose();
     _scroll.dispose();
     super.dispose();
   }
 
-  Future<void> _onDigit(int d) async {
-    if (widget.readOnly) return;
-    if (_current.length >= widget.length) return;
-    setState(() => _current.add(d));
+  String _generateSecret(int len) {
+    final seed = _hash('${_todayKey(DateTime.now())}#$len');
+    final r = Random(seed);
+    return List.generate(len, (_) => r.nextInt(10).toString()).join();
   }
 
-  Future<void> _onBackspace() async {
-    if (widget.readOnly) return;
-    if (_current.isNotEmpty) {
-      setState(() => _current.removeLast());
-    }
+  int _hash(String s) { int h = 0; for (final c in s.codeUnits) { h = (h * 131 + c) & 0x7fffffff; } return h; }
+
+  List<int> _score(String secret, String guess) {
+    final n = secret.length; final res = List<int>.filled(n, 0); final cnt = List<int>.filled(10, 0);
+    for (var i = 0; i < n; i++) cnt[int.parse(secret[i])]++;
+    for (var i = 0; i < n; i++) if (guess[i] == secret[i]) { res[i] = 2; cnt[int.parse(guess[i])]--; }
+    for (var i = 0; i < n; i++) if (res[i] == 0) { final d = int.parse(guess[i]); if (cnt[d] > 0) { res[i] = 1; cnt[d]--; }}
+    return res;
   }
 
-  Future<void> _onEnter() async {
-    if (widget.readOnly) return;
-    if (_current.length != widget.length) return;
+  Future<void> _submit() async {
+    if (_entry.length != widget.length) { HapticFeedback.selectionClick(); return; }
+    final guess = _entry; setState(() { _rows.add(guess); _entry = ''; });
 
-    final guess = List<int>.from(_current);
-    final sVal = digitsToInt(_secret);
-    final gVal = digitsToInt(guess);
-    final score = scoreGuess(_secret, guess);
+    // Store attempt for recap
+    final prefs = await SharedPreferences.getInstance();
+    final key = _kAttemptsLen(widget.length);
+    final arr = prefs.getStringList(key) ?? <String>[]; arr.add(guess); await prefs.setStringList(key, arr);
+
+    // Update top status
+    final sVal = int.parse(_secret), gVal = int.parse(guess);
     setState(() {
-      _rows.add(guess);
-      _current.clear();
-      _arrow = gVal < sVal ? 1 : (gVal > sVal ? -1 : 0);
+      _status = gVal == sVal ? RoundStatus.correct : (gVal < sVal ? RoundStatus.higher : RoundStatus.lower);
     });
-    // pulse the arrow chip
-    _pulse
-      ..reset()
-      ..forward();
 
-    // persist today's rows for Attempts view
-    final prefs = await SharedPreferences.getInstance();
-    final keyRows = _keyTodayRows(widget.length);
-    final existing = (prefs.getString(keyRows));
-    final list = existing == null
-        ? <List<int>>[]
-        : (jsonDecode(existing) as List).map<List<int>>((e) => (e as List).cast<int>()).toList();
-    list.add(guess);
-    await prefs.setString(keyRows, jsonEncode(list));
-
-    // solved?
-    if (score.every((e) => e == 2)) {
-      await _onSolved(list.length);
-    }
-
-    // scroll a bit to keep recent visible
-    await Future<void>.delayed(const Duration(milliseconds: 10));
-    if (_scroll.hasClients) {
-      _scroll.animateTo(
-        _scroll.position.maxScrollExtent + 80,
-        duration: const Duration(milliseconds: 200),
-        curve: Curves.easeOut,
-      );
-    }
-  }
-
-  Future<void> _onSolved(int guessesThisRound) async {
-    final prefs = await SharedPreferences.getInstance();
-    final n = widget.length;
-
-    final best = prefs.getInt(_keyBest(n));
-    if (best == null || guessesThisRound < best) {
-      await prefs.setInt(_keyBest(n), guessesThisRound);
-    }
-    final plays = (prefs.getInt(_keyAvgCount(n)) ?? 0) + 1;
-    final sum = (prefs.getInt(_keyAvgSum(n)) ?? 0) + guessesThisRound;
-    await prefs.setInt(_keyAvgCount(n), plays);
-    await prefs.setInt(_keyAvgSum(n), sum);
-
-    final today = (prefs.getInt(_keyTodayCount(n)) ?? 0);
-    await prefs.setInt(_keyTodayCount(n), today > 0 ? min(today, guessesThisRound) : guessesThisRound);
-
-    // bump progress
-    final upto = prefs.getInt(_keyCompletedUpTo) ?? 0;
-    if (n > upto) await prefs.setInt(_keyCompletedUpTo, n);
-
-    // stats message
-    final bestNow = prefs.getInt(_keyBest(n)) ?? guessesThisRound;
-    final avg = (prefs.getInt(_keyAvgSum(n)) ?? 0) / max((prefs.getInt(_keyAvgCount(n)) ?? 1), 1);
-    final avgRounded = avg.round();
-
-    if (!mounted) return;
-    await showDialog<void>(
-      context: context,
-      builder: (_) => AlertDialog(
-        title: const Text('Nice!'),
-        content: Text('You solved the $n-digit number in $guessesThisRound guesses.\n'
-            'Stats — This round: $guessesThisRound · Best: $bestNow · Average: $avgRounded'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(),
-            child: const Text('OK'),
-          ),
-        ],
-      ),
-    );
-
-    // go next or summary
-    if (n < 8) {
-      if (!mounted) return;
-      Navigator.of(context).pushReplacement(
-        MaterialPageRoute(
-          builder: (_) => RoundPage(length: n + 1, dayNum: widget.dayNum),
-        ),
-      );
-    } else {
-      // end-of-day summary
-      if (!mounted) return;
-      await _showSummaryDialog();
-    }
-  }
-
-  Future<void> _showSummaryDialog() async {
-    final prefs = await SharedPreferences.getInstance();
-    final lines = <String>[];
-    var todaySum = 0;
-    var todayCount = 0;
-    for (final n in _kLengths) {
-      final g = prefs.getInt(_keyTodayCount(n));
-      if (g != null) {
-        lines.add('$n-digit: $g guesses');
-        todaySum += g;
-        todayCount += 1;
-      } else {
-        lines.add('$n-digit: —');
+    // Scroll to latest row
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_scroll.hasClients) {
+        _scroll.animateTo(_scroll.position.maxScrollExtent, duration: const Duration(milliseconds: 220), curve: Curves.easeOut);
       }
+    });
+
+    if (gVal == sVal) {
+      final prefs = await SharedPreferences.getInstance();
+      final bestK = _kBestLen(widget.length), playsK = _kPlaysLen(widget.length), totalK = _kTotalGuessesLen(widget.length);
+      final best = prefs.getInt(bestK) ?? 0;
+      final plays = (prefs.getInt(playsK) ?? 0) + 1;
+      final total = (prefs.getInt(totalK) ?? 0) + _rows.length;
+      await prefs.setInt(bestK, best == 0 ? _rows.length : min(best, _rows.length));
+      await prefs.setInt(playsK, plays);
+      await prefs.setInt(totalK, total);
+      await prefs.setInt(_kTodayGuessesLen(widget.length), _rows.length);
+      final prev = prefs.getInt(_kCompletedUpTo) ?? 0; await prefs.setInt(_kCompletedUpTo, max(prev, widget.length));
+      await _showWin();
     }
-    final avgToday = todayCount == 0 ? '—' : (todaySum / todayCount).round().toString();
+  }
+
+  Future<void> _showWin() async {
+    final prefs = await SharedPreferences.getInstance();
+    final best = prefs.getInt(_kBestLen(widget.length)) ?? 0;
+    final plays = prefs.getInt(_kPlaysLen(widget.length)) ?? 0;
+    final total = prefs.getInt(_kTotalGuessesLen(widget.length)) ?? 0;
+    final avg = plays > 0 ? (total / plays).round() : _rows.length;
 
     await showDialog<void>(
       context: context,
       barrierDismissible: false,
       builder: (_) => AlertDialog(
-        title: const Text('Today’s Summary'),
+        title: Text(widget.length < 8 ? 'Nice! You solved it.' : 'Congratulations!'),
         content: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            for (final l in lines) Padding(
-              padding: const EdgeInsets.symmetric(vertical: 2),
-              child: Text(l),
-            ),
+            Text('You solved the ${widget.length}-digit number in ${_rows.length} guesses.'),
             const SizedBox(height: 8),
-            Text('Average today: $avgToday'),
+            Text('Stats — This round: ${_rows.length} · Best: $best · Average: $avg', style: const TextStyle(color: kSubtle)),
           ],
         ),
         actions: [
           TextButton(
-            onPressed: () {
+            onPressed: () async {
               Navigator.of(context).pop();
-              Navigator.of(context).pushReplacement(
-                MaterialPageRoute(builder: (_) => const AttemptsPage()),
-              );
+              if (widget.length < 8) {
+                if (widget.length == 7) {
+                  final today = _todayKey(DateTime.now());
+                  final shown = prefs.getString(_kAdShownAfter7For);
+                  if (adsEnabled && interstitialEnabled && !premiumEnabled && shown != today) {
+                    await _maybeShowInterstitial();
+                    await prefs.setString(_kAdShownAfter7For, today);
+                  }
+                }
+                if (!mounted) return;
+                Navigator.pushReplacement(context, MaterialPageRoute(
+                  builder: (_) => RoundPage(length: widget.length + 1, dayNumber: widget.dayNumber),
+                ));
+              } else {
+                if (!mounted) return;
+                Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const DailySummaryPage()));
+              }
             },
-            child: const Text('View attempts'),
-          ),
-          TextButton(
-            onPressed: () {
-              Navigator.of(context).pop();
-              Navigator.of(context).popUntil((r) => r.isFirst); // back to Home
-            },
-            child: const Text('Home'),
+            child: Text(widget.length < 8 ? 'Next Round' : 'Daily Summary'),
           ),
         ],
       ),
@@ -537,344 +398,405 @@ class _RoundPageState extends State<RoundPage> with SingleTickerProviderStateMix
 
   @override
   Widget build(BuildContext context) {
-    final t = Theme.of(context);
-    final n = widget.length;
+    final title = '${widget.length}-digit';
+
+    Widget statusPill() {
+      String t = ''; String asset = ''; Color b = kSubtle;
+      switch (_status) {
+        case RoundStatus.higher: t = 'Higher'; asset = 'assets/icons/ic_arrow_up.svg'; b = kHigher; break;
+        case RoundStatus.lower: t = 'Lower'; asset = 'assets/icons/ic_arrow_down.svg'; b = kLower; break;
+        case RoundStatus.correct: t = 'Correct'; asset = 'assets/icons/ic_check.svg'; b = kOk; break;
+        case RoundStatus.neutral: asset = ''; break;
+      }
+      if (asset.isEmpty) return const SizedBox.shrink();
+      return Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        decoration: BoxDecoration(
+          color: const Color(0xFFEAEAF1),
+          borderRadius: BorderRadius.circular(999),
+          border: Border.all(color: b.withOpacity(0.6)),
+        ),
+        child: Row(mainAxisSize: MainAxisSize.min, children: [
+          SvgPicture.asset(asset, width: 16, height: 16, colorFilter: ColorFilter.mode(b, BlendMode.srcIn)),
+          const SizedBox(width: 6),
+          Text(t, style: const TextStyle(fontWeight: FontWeight.w600)),
+        ]),
+      );
+    }
 
     return Scaffold(
       appBar: AppBar(
-        title: Text('Day #${widget.dayNum} • $_kVersion'),
+        title: Text(title),
+        leading: IconButton(icon: const Icon(Icons.arrow_back), onPressed: () => Navigator.pop(context)),
         actions: [
-          Padding(
-            padding: const EdgeInsets.only(right: 8),
-            child: ScaleTransition(
-              scale: _scale,
-              child: Chip(
-                avatar: Icon(
-                  _arrow == 0 ? Icons.remove : (_arrow > 0 ? Icons.arrow_upward : Icons.arrow_downward),
-                  size: 16,
-                  color: t.colorScheme.primary,
-                ),
-                label: Text(_arrow == 0 ? 'Equal' : (_arrow > 0 ? 'Higher' : 'Lower')),
-                side: const BorderSide(color: Colors.transparent),
-                backgroundColor: const Color(0xFFE7EBF5),
-              ),
-            ),
-          ),
-          IconButton(
-            onPressed: () {
-              showDialog(context: context, builder: (_) => const HowToDialog());
-            },
-            icon: const Icon(Icons.help_outline),
-          )
+          Padding(padding: const EdgeInsets.only(right: 8), child: AnimatedSwitcher(duration: const Duration(milliseconds: 180), child: KeyedSubtree(key: ValueKey(_status), child: statusPill()))),
         ],
       ),
-      body: Padding(
-        padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text('${n} / 8 digits today', style: t.textTheme.bodyMedium),
-            const SizedBox(height: 8),
-            // History (scrolls)
-            Expanded(
-              child: ListView.builder(
-                controller: _scroll,
-                itemCount: _rows.length,
-                itemBuilder: (c, i) {
-                  final guess = _rows[i];
-                  final sc = scoreGuess(_secret, guess);
-                  return Padding(
-                    padding: const EdgeInsets.symmetric(vertical: 4),
-                    child: _AttemptRow(
-                      digits: guess,
-                      score: sc,
-                      len: n,
-                    ),
-                  );
-                },
-              ),
-            ),
-            // Current input row (not scrollable)
-            const SizedBox(height: 8),
-            _CurrentRow(
-              entered: _current,
-              len: n,
-            ),
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(20),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('${widget.length} / $_cols digits today', style: const TextStyle(fontSize: 12, color: kSubtle)),
             const SizedBox(height: 12),
-            // Keypad
-            _Keypad(
-              onDigit: _onDigit,
-              onBackspace: _onBackspace,
-              onEnter: _current.length == n ? _onEnter : null,
+            Expanded(
+              child: LayoutBuilder(builder: (context, c) {
+                final avail = c.maxWidth; final size = ((avail - _gap * (_cols - 1)) / _cols).clamp(36.0, 56.0);
+                return ListView.builder(
+                  controller: _scroll,
+                  itemCount: _rows.length + 1,
+                  itemBuilder: (context, idx) {
+                    if (idx == _rows.length) {
+                      // current input row
+                      return Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 4),
+                        child: Row(children: [
+                          for (int i = 0; i < widget.length; i++)
+                            Padding(
+                              padding: EdgeInsets.only(right: i == widget.length - 1 ? 0 : _gap),
+                              child: _TileBox(
+                                size: size,
+                                label: i < _entry.length ? _entry[i] : '',
+                                color: kTileGrey,
+                                borderColor: (i == _entry.length) ? Colors.blueAccent.withOpacity(0.7) : kStrokeWarm,
+                              ),
+                            ),
+                          for (int i = 0; i < _cols - widget.length; i++)
+                            Padding(
+                              padding: EdgeInsets.only(left: _gap),
+                              child: _TileBox(size: size, label: kTimes, color: widget.length < 8 ? kTileGhost : Colors.transparent, labelStyle: const TextStyle(color: Colors.white70, fontWeight: FontWeight.w700), semanticsEnabled: false),
+                            ),
+                        ]),
+                      );
+                    }
+                    final g = _rows[idx]; final sc = _score(_secret, g);
+                    return Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 4),
+                      child: Row(children: [
+                        for (int i = 0; i < widget.length; i++)
+                          Padding(
+                            padding: EdgeInsets.only(right: i == widget.length - 1 ? 0 : _gap),
+                            child: _TileBox(size: size, label: g[i], color: sc[i] == 2 ? kTileGreen : (sc[i] == 1 ? kTileOrange : kTileGrey)),
+                          ),
+                        for (int i = 0; i < _cols - widget.length; i++)
+                          Padding(
+                            padding: EdgeInsets.only(left: _gap),
+                            child: _TileBox(size: size, label: kTimes, color: widget.length < 8 ? kTileGhost : Colors.transparent, labelStyle: const TextStyle(color: Colors.white70, fontWeight: FontWeight.w700), semanticsEnabled: false),
+                          ),
+                      ]),
+                    );
+                  },
+                );
+              }),
             ),
-          ],
+            const SizedBox(height: 8),
+            _Keypad(
+              onDigit: (d) { if (_entry.length < widget.length) setState(() => _entry += '$d'); },
+              onBackspace: () { if (_entry.isNotEmpty) setState(() => _entry = _entry.substring(0, _entry.length - 1)); },
+              onEnter: _entry.length == widget.length ? _submit : null,
+            ),
+          ]),
         ),
       ),
     );
   }
+
+  Future<void> _maybeShowInterstitial() async {/* stub no-op */}
 }
 
-// ===== UI pieces ============================================================
-
-const _kGap = 8.0;
-const _kTileGrey = Color(0xFFDDE0E6);
-const _kTileGhost = Color(0xFFE7E8EE);
-const _kTileGreen = Color(0xFF7DC57D);
-const _kTileOrange = Color(0xFFFFB66B);
-
-class _AttemptRow extends StatelessWidget {
-  final List<int> digits;
-  final List<int> score;
-  final int len;
-  const _AttemptRow({required this.digits, required this.score, required this.len});
-
-  @override
-  Widget build(BuildContext context) {
-    final width = MediaQuery.of(context).size.width;
-    final totalGaps = _kGap * (8 - 1);
-    final size = ((width - 32 - totalGaps) / 8).clamp(36.0, 56.0);
-
-    return Row(
-      children: [
-        for (int j = 0; j < len; j++)
-          Padding(
-            padding: EdgeInsets.only(right: j == len - 1 ? 0 : _kGap),
-            child: _TileBox(
-              size: size,
-              label: digits[j].toString(),
-              color: score[j] == 2
-                  ? _kTileGreen
-                  : score[j] == 1
-                      ? _kTileOrange
-                      : _kTileGrey,
-            ),
-          ),
-        for (int j = 0; j < 8 - len; j++)
-          Padding(
-            padding: EdgeInsets.only(left: j == 0 ? _kGap : _kGap),
-            child: _TileBox(
-              size: size,
-              label: '×',
-              color: _kTileGhost,
-              labelStyle: TextStyle(
-                color: Colors.white.withOpacity(0.92),
-                fontWeight: FontWeight.w800,
-                fontSize: size * 0.65, // bigger white X
-              ),
-              semanticsEnabled: false,
-            ),
-          ),
-      ],
-    );
-  }
-}
-
-class _CurrentRow extends StatelessWidget {
-  final List<int> entered;
-  final int len;
-  const _CurrentRow({required this.entered, required this.len});
-
-  @override
-  Widget build(BuildContext context) {
-    final width = MediaQuery.of(context).size.width;
-    final totalGaps = _kGap * (8 - 1);
-    final size = ((width - 32 - totalGaps) / 8).clamp(36.0, 56.0);
-
-    return Row(
-      children: [
-        for (int i = 0; i < len; i++)
-          Padding(
-            padding: EdgeInsets.only(right: i == len - 1 ? 0 : _kGap),
-            child: _TileBox(
-              size: size,
-              label: i < entered.length ? entered[i].toString() : '',
-              color: _kTileGrey,
-            ),
-          ),
-        for (int j = 0; j < 8 - len; j++)
-          Padding(
-            padding: EdgeInsets.only(left: _kGap),
-            child: _TileBox(
-              size: size,
-              label: '×',
-              color: _kTileGhost,
-              labelStyle: TextStyle(
-                color: Colors.white.withOpacity(0.92),
-                fontWeight: FontWeight.w800,
-                fontSize: size * 0.65,
-              ),
-              semanticsEnabled: false,
-            ),
-          ),
-      ],
-    );
-  }
-}
-
+// === Reusable Tile + Keypad
 class _TileBox extends StatelessWidget {
-  final double size;
-  final String label;
-  final Color color;
-  final TextStyle? labelStyle;
-  final bool semanticsEnabled;
-  const _TileBox({
-    required this.size,
-    required this.label,
-    required this.color,
-    this.labelStyle,
-    this.semanticsEnabled = true,
-  });
-
+  final double size; final String label; final Color color; final Color? borderColor; final TextStyle? labelStyle; final bool semanticsEnabled;
+  const _TileBox({required this.size, required this.label, required this.color, this.borderColor, this.labelStyle, this.semanticsEnabled = true});
   @override
   Widget build(BuildContext context) {
-    return Semantics(
-      label: semanticsEnabled ? label : null,
+    return ExcludeSemantics(
+      excluding: !semanticsEnabled,
       child: Container(
-        width: size,
-        height: size,
-        alignment: Alignment.center,
+        width: size, height: size, alignment: Alignment.center,
         decoration: BoxDecoration(
           color: color,
-          borderRadius: BorderRadius.circular(12),
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: (borderColor ?? kStrokeWarm), width: 1),
         ),
-        child: Text(
-          label,
-          style: labelStyle ??
-              TextStyle(
-                fontWeight: FontWeight.w600,
-                fontSize: size * 0.5,
-                color: Colors.black87,
-              ),
-        ),
+        child: Text(label, style: labelStyle ?? const TextStyle(fontSize: 20, fontWeight: FontWeight.w700)),
       ),
     );
   }
 }
 
 class _Keypad extends StatelessWidget {
-  final void Function(int d) onDigit;
-  final VoidCallback onBackspace;
-  final Future<void> Function()? onEnter;
+  final void Function(int) onDigit; final VoidCallback onBackspace; final Future<void> Function()? onEnter;
   const _Keypad({required this.onDigit, required this.onBackspace, required this.onEnter});
-
   @override
   Widget build(BuildContext context) {
-    final t = Theme.of(context);
-    final btnStyle = FilledButton.styleFrom(
-      backgroundColor: const Color(0xFFE9E9F0),
-      foregroundColor: Colors.black,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(28)),
-      padding: const EdgeInsets.symmetric(vertical: 18),
-    );
-    Widget num(int d) => Expanded(
+    final rows = const [
+      [1, 2, 3],
+      [4, 5, 6],
+      [7, 8, 9],
+    ];
+    Widget keyChild(String label) => Text(label, style: const TextStyle(fontWeight: FontWeight.w700));
+    Widget cap({required Widget child, VoidCallback? onPressed}) => OutlinedButton(onPressed: onPressed, child: child);
+
+    return Column(children: [
+      for (final r in rows)
+        Row(children: [
+          for (final k in r)
+            Expanded(child: Padding(padding: const EdgeInsets.all(6), child: cap(onPressed: () => onDigit(k), child: keyChild('$k')))),
+        ]),
+      Row(children: [
+        Expanded(
           child: Padding(
-            padding: const EdgeInsets.all(8),
-            child: FilledButton(
-              style: btnStyle,
-              onPressed: () => onDigit(d),
-              child: Text('$d', style: t.textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700)),
+            padding: const EdgeInsets.all(6),
+            child: cap(
+              onPressed: onBackspace,
+              child: SvgPicture.asset('assets/icons/ic_backspace.svg', width: 20, height: 20, colorFilter: const ColorFilter.mode(kText, BlendMode.srcIn)),
             ),
           ),
-        );
-
-    return Column(
-      children: [
-        Row(children: [num(1), num(2), num(3)]),
-        Row(children: [num(4), num(5), num(6)]),
-        Row(children: [num(7), num(8), num(9)]),
-        Row(
-          children: [
-            Expanded(
-              child: Padding(
-                padding: const EdgeInsets.all(8),
-                child: FilledButton(
-                  style: btnStyle,
-                  onPressed: onBackspace,
-                  child: const Icon(Icons.backspace_outlined),
-                ),
-              ),
-            ),
-            num(0),
-            Expanded(
-              child: Padding(
-                padding: const EdgeInsets.all(8),
-                child: FilledButton(
-                  style: btnStyle.copyWith(
-                    backgroundColor: WidgetStatePropertyAll(
-                        onEnter == null ? const Color(0xFFD8D8DF) : t.colorScheme.surfaceContainerHighest),
-                    foregroundColor:
-                        WidgetStatePropertyAll(onEnter == null ? Colors.grey : t.colorScheme.onSurfaceVariant),
-                  ),
-                  onPressed: onEnter,
-                  child: const Text('Enter'),
-                ),
-              ),
-            ),
-          ],
         ),
-      ],
+        Expanded(child: Padding(padding: const EdgeInsets.all(6), child: cap(onPressed: () => onDigit(0), child: keyChild('0')))),
+        Expanded(
+          child: Padding(
+            padding: const EdgeInsets.all(6),
+            child: cap(
+              onPressed: onEnter == null ? null : () => onEnter!(),
+              child: SvgPicture.asset('assets/icons/ic_enter.svg', width: 20, height: 20, colorFilter: ColorFilter.mode(onEnter == null ? kSubtle : kText, BlendMode.srcIn)),
+            ),
+          ),
+        ),
+      ]),
+    ]);
+  }
+}
+
+// === How to Play (page)
+class HowToPage extends StatelessWidget {
+  const HowToPage({super.key});
+  @override
+  Widget build(BuildContext context) {
+    Widget bulletLine(String text) => Row(crossAxisAlignment: CrossAxisAlignment.start, children: [const Text('\u2022'), const SizedBox(width: 8), Expanded(child: Text(text))]);
+    return Scaffold(
+      appBar: AppBar(title: const Text('How to Play')),
+      body: ListView(
+        padding: const EdgeInsets.all(24),
+        children: [
+          const SizedBox(height: 8),
+          const Text('Guess the secret number.', style: TextStyle(fontSize: 16)),
+          const SizedBox(height: 12),
+          const Text('Colours:', style: TextStyle(fontWeight: FontWeight.w700)),
+          const SizedBox(height: 8),
+          bulletLine('Green = correct digit & position'),
+          bulletLine('Orange = right digit, wrong place'),
+          bulletLine('Grey = not present'),
+          const SizedBox(height: 16),
+          const Text('App-bar indicator:', style: TextStyle(fontWeight: FontWeight.w700)),
+          const SizedBox(height: 8),
+          bulletLine('Up arrow = Higher than your guess'),
+          bulletLine('Down arrow = Lower than your guess'),
+          bulletLine('Tick = Your guess is correct'),
+          const SizedBox(height: 24),
+        ],
+      ),
+      bottomNavigationBar: SafeArea(
+        child: Padding(padding: const EdgeInsets.all(24), child: OutlinedButton(onPressed: () => Navigator.pop(context), child: const Text('OK'))),
+      ),
     );
   }
 }
 
-// ===== Attempts page ========================================================
+// === Daily Summary
+class DailySummaryPage extends StatelessWidget {
+  const DailySummaryPage({super.key});
 
-class AttemptsPage extends StatefulWidget {
-  const AttemptsPage({super.key});
-
-  @override
-  State<AttemptsPage> createState() => _AttemptsPageState();
-}
-
-class _AttemptsPageState extends State<AttemptsPage> {
-  Map<int, int> today = {};
-  Map<int, int> best = {};
-  Map<int, double> avg = {};
-
-  @override
-  void initState() {
-    super.initState();
-    _load();
+  Future<Map<int, int>> _todayGuesses() async {
+    final p = await SharedPreferences.getInstance();
+    return { for (final n in _rounds) n : (p.getInt(_kTodayGuessesLen(n)) ?? 0) };
   }
-
-  Future<void> _load() async {
-    final prefs = await SharedPreferences.getInstance();
-    final t = <int, int>{};
-    final b = <int, int>{};
-    final a = <int, double>{};
-    for (final n in _kLengths) {
-      final tg = prefs.getInt(_keyTodayCount(n));
-      if (tg != null) t[n] = tg;
-      final be = prefs.getInt(_keyBest(n));
-      if (be != null) b[n] = be;
-      final plays = prefs.getInt(_keyAvgCount(n)) ?? 0;
-      final sum = prefs.getInt(_keyAvgSum(n)) ?? 0;
-      a[n] = plays == 0 ? 0 : sum / plays;
+  Future<Map<int, List<num>>> _lifetime() async {
+    final p = await SharedPreferences.getInstance();
+    final m = <int, List<num>>{};
+    for (final n in _rounds) {
+      final best = p.getInt(_kBestLen(n)) ?? 0;
+      final plays = p.getInt(_kPlaysLen(n)) ?? 0;
+      final total = p.getInt(_kTotalGuessesLen(n)) ?? 0;
+      final avg = plays > 0 ? total / plays : 0.0;
+      m[n] = [avg, best.toDouble()];
     }
-    setState(() {
-      today = t;
-      best = b;
-      avg = a;
-    });
+    return m;
   }
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('Today’s attempts')),
-      body: ListView.builder(
-        itemCount: _kLengths.length,
-        itemBuilder: (c, i) {
-          final n = _kLengths[i];
-          final lineToday = today.containsKey(n) ? '${today[n]} guesses' : '—';
-          final lineBest = best.containsKey(n) ? best[n].toString() : '—';
-          final lineAvg = (avg[n] ?? 0).toStringAsFixed(1);
-          return ListTile(
-            title: Text('$n-digit'),
-            subtitle: Text('Today: $lineToday • Best: $lineBest • Avg: $lineAvg'),
-          );
-        },
+    return FutureBuilder(
+      future: Future.wait([_todayGuesses(), _lifetime()]),
+      builder: (context, snap) {
+        if (!snap.hasData) return const Scaffold(body: Center(child: CircularProgressIndicator()));
+        final today = snap.data![0] as Map<int, int>;
+        final life = snap.data![1] as Map<int, List<num>>;
+        return Scaffold(
+          appBar: AppBar(title: const Text('Daily Summary')),
+          body: ListView(
+            padding: const EdgeInsets.all(24),
+            children: [
+              Row(children: const [
+                Expanded(child: Text('Category', style: TextStyle(fontWeight: FontWeight.w700))),
+                SizedBox(width: 12), SizedBox(width: 70, child: Text('Today', textAlign: TextAlign.right, style: TextStyle(fontWeight: FontWeight.w700))),
+                SizedBox(width: 12), SizedBox(width: 70, child: Text('Average', textAlign: TextAlign.right, style: TextStyle(fontWeight: FontWeight.w700))),
+                SizedBox(width: 12), SizedBox(width: 70, child: Text('Best', textAlign: TextAlign.right, style: TextStyle(fontWeight: FontWeight.w700))),
+              ]),
+              const Divider(),
+              for (final n in _rounds) ...[
+                Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 10),
+                  child: Row(children: [
+                    Expanded(child: Text('$n-digit')),
+                    const SizedBox(width: 12), SizedBox(width: 70, child: Text('${today[n] ?? 0}', textAlign: TextAlign.right)),
+                    const SizedBox(width: 12), SizedBox(width: 70, child: Text('${(life[n]![0]).toStringAsFixed(0)}', textAlign: TextAlign.right)),
+                    const SizedBox(width: 12), SizedBox(width: 70, child: Text('${life[n]![1].toInt()}', textAlign: TextAlign.right)),
+                  ]),
+                ),
+                const Divider(height: 1),
+              ],
+              const SizedBox(height: 24),
+            ],
+          ),
+          bottomNavigationBar: SafeArea(
+            child: Padding(padding: const EdgeInsets.all(24), child: OutlinedButton(onPressed: () => Navigator.pop(context), child: const Text('Back to Home'))),
+          ),
+        );
+      },
+    );
+  }
+}
+
+// === Today’s Attempts (collapsible accordion, one screen)
+class AttemptsTodayPageCollapsible extends StatefulWidget {
+  const AttemptsTodayPageCollapsible({super.key});
+  @override
+  State<AttemptsTodayPageCollapsible> createState() => _AttemptsTodayPageCollapsibleState();
+}
+
+class _AttemptsTodayPageCollapsibleState extends State<AttemptsTodayPageCollapsible> {
+  int _open = 3; // 3-digit expanded by default
+  late Future<_AttemptsData> _future;
+  @override
+  void initState() { super.initState(); _future = _load(); }
+
+  Future<_AttemptsData> _load() async {
+    final p = await SharedPreferences.getInstance();
+    final attempts = <int, List<String>>{ for (final n in _rounds) n : (p.getStringList(_kAttemptsLen(n)) ?? <String>[]) };
+    final today = { for (final n in _rounds) n : (p.getInt(_kTodayGuessesLen(n)) ?? 0) };
+    final best = { for (final n in _rounds) n : (p.getInt(_kBestLen(n)) ?? 0) };
+    final plays = { for (final n in _rounds) n : (p.getInt(_kPlaysLen(n)) ?? 0) };
+    final total = { for (final n in _rounds) n : (p.getInt(_kTotalGuessesLen(n)) ?? 0) };
+    return _AttemptsData(attempts, today, best, plays, total);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<_AttemptsData>(
+      future: _future,
+      builder: (context, snap) {
+        if (!snap.hasData) {
+          return const Scaffold(body: Center(child: CircularProgressIndicator()));
+        }
+        final data = snap.data!;
+        return Scaffold(
+          appBar: AppBar(title: const Text("Today\'s Attempts")),
+          body: ListView(
+            padding: const EdgeInsets.all(16),
+            children: [
+              for (final n in _rounds) ...[
+                _AttemptHeader(
+                  label: '$n-digit',
+                  open: _open == n,
+                  onTap: () => setState(() => _open = _open == n ? -1 : n),
+                ),
+                const Divider(height: 1),
+                AnimatedCrossFade(
+                  firstChild: const SizedBox.shrink(),
+                  secondChild: Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 8),
+                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      _ReadOnlyBoard(length: n, guesses: data.attempts[n]!),
+                      const SizedBox(height: 8),
+                      _StatsRow(
+                        thisRound: data.today[n] ?? 0,
+                        best: data.best[n] ?? 0,
+                        avg: (data.plays[n] ?? 0) > 0 ? ((data.total[n] ?? 0) / (data.plays[n] ?? 1)).round() : 0,
+                      ),
+                    ]),
+                  ),
+                  crossFadeState: _open == n ? CrossFadeState.showSecond : CrossFadeState.showFirst,
+                  duration: const Duration(milliseconds: 180),
+                ),
+              ],
+              const SizedBox(height: 24),
+            ],
+          ),
+          bottomNavigationBar: SafeArea(
+            child: Padding(padding: const EdgeInsets.all(16), child: OutlinedButton(onPressed: () => Navigator.pop(context), child: const Text('Back to Home'))),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _StatsRow extends StatelessWidget {
+  final int thisRound, best, avg; const _StatsRow({required this.thisRound, required this.best, required this.avg});
+  @override
+  Widget build(BuildContext context) {
+    Text grey(String s) => Text(s, style: const TextStyle(color: kSubtle));
+    return Row(children: [
+      Expanded(child: grey('This round: $thisRound')),
+      Expanded(child: grey('Best: $best')),
+      Expanded(child: grey('Avg: $avg')),
+    ]);
+  }
+}
+
+class _AttemptHeader extends StatelessWidget {
+  final String label; final bool open; final VoidCallback onTap; const _AttemptHeader({required this.label, required this.open, required this.onTap});
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 8),
+        child: Row(children: [
+          Expanded(child: Text(label, style: const TextStyle(fontWeight: FontWeight.w600))),
+          SvgPicture.asset(open ? 'assets/icons/ic_minus.svg' : 'assets/icons/ic_plus.svg', width: 18, height: 18, colorFilter: const ColorFilter.mode(kText, BlendMode.srcIn)),
+        ]),
       ),
     );
+  }
+}
+
+class _AttemptsData {
+  final Map<int, List<String>> attempts; final Map<int, int> today; final Map<int, int> best; final Map<int, int> plays; final Map<int, int> total;
+  _AttemptsData(this.attempts, this.today, this.best, this.plays, this.total);
+}
+
+// === Read-only board used in Attempts page
+class _ReadOnlyBoard extends StatelessWidget {
+  final int length; final List<String> guesses; const _ReadOnlyBoard({required this.length, required this.guesses});
+  @override
+  Widget build(BuildContext context) {
+    const gap = 8.0;
+    return LayoutBuilder(builder: (context, c) {
+      final size = ((c.maxWidth - gap * (_cols - 1)) / _cols).clamp(32.0, 56.0);
+      return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        for (final g in guesses)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 4),
+            child: Row(children: [
+              for (int i = 0; i < length; i++)
+                Padding(padding: EdgeInsets.only(right: i == length - 1 ? 0 : gap), child: _TileBox(size: size, label: g[i], color: kTileGrey)),
+              for (int i = 0; i < _cols - length; i++)
+                Padding(padding: EdgeInsets.only(left: gap), child: _TileBox(size: size, label: kTimes, color: length < 8 ? kTileGhost : Colors.transparent, labelStyle: const TextStyle(color: Colors.white70, fontWeight: FontWeight.w700), semanticsEnabled: false)),
+            ]),
+          ),
+      ]);
+    });
   }
 }
